@@ -14,6 +14,7 @@ from .utils import (
     setup_category_loggers,
     SparseRetrievalCache,
     question_hash,
+    build_retrieval_query,
 )
 
 __all__ = [
@@ -41,4 +42,5 @@ __all__ = [
     'setup_category_loggers',
     'SparseRetrievalCache',
     'question_hash',
+    'build_retrieval_query',
 ]

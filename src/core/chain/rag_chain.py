@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ..generator import OpenAIGenerator, PromptGenerator, VLLMGenerator
-from ..utils import question_hash
+from ..utils import build_retrieval_query, question_hash
 
 
 @dataclass
@@ -81,7 +81,15 @@ class RAGChain:
 
         for row in rows:
             q = row.get("question", "")
-            retrieved = self.retrieve(q)
+            retrieval_query = build_retrieval_query(
+                question=q,
+                dataset=row.get("dataset"),
+                options=row.get("options"),
+            )
+            retrieved = self.retrieve(retrieval_query)
+            if not retrieved and retrieval_query != q:
+                # Backward compatibility with older caches keyed by raw question.
+                retrieved = self.retrieve(q)
             retrieved_all.append(retrieved)
 
             if self.retrieval_mode == "llm_only":

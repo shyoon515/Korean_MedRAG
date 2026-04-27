@@ -8,6 +8,34 @@ def question_hash(question: str) -> str:
     return hashlib.sha1(question.encode("utf-8")).hexdigest()
 
 
+def build_retrieval_query(
+    question: str,
+    dataset: Optional[str] = None,
+    options: Optional[Dict[str, str]] = None,
+) -> str:
+    """Build a cache lookup query string.
+
+    For KorMedMCQA, include choices as numbered lines so sparse retrieval can
+    use the same information level as data MCQ prompts.
+    """
+    base_question = (question or "").strip()
+    is_kormed = (dataset or "").lower() == "kormedmcqa"
+    if not is_kormed or not options:
+        return base_question
+
+    option_lines = []
+    for idx, key in enumerate(["A", "B", "C", "D", "E"], start=1):
+        text = (options.get(key) or "").strip()
+        if not text:
+            continue
+        option_lines.append(f"{idx}) {text}")
+
+    if not option_lines:
+        return base_question
+
+    return f"{base_question}\n" + "\n".join(option_lines)
+
+
 class SparseRetrievalCache:
     """Dictionary-like cache for sparse retrieval results."""
 

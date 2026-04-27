@@ -19,6 +19,7 @@ try:
         BM25Retriever,
         KorMedMCQALoader,
         SparseRetrievalCache,
+        build_retrieval_query,
         question_hash,
         setup_category_loggers,
     )
@@ -28,6 +29,7 @@ except ImportError:
         BM25Retriever,
         KorMedMCQALoader,
         SparseRetrievalCache,
+        build_retrieval_query,
         question_hash,
         setup_category_loggers,
     )
@@ -43,13 +45,19 @@ KORMEDMCQA_SPLITS = [
 ]
 
 
-def build_cache_entry(split_name: str, qa: Dict[str, Any], retrieved: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_cache_entry(
+    split_name: str,
+    qa: Dict[str, Any],
+    retrieved: List[Dict[str, Any]],
+    retrieval_query: str,
+) -> Dict[str, Any]:
     return {
         "dataset": "KorMedMCQA",
         "split": split_name,
         "source": split_name,
         "question_id": qa.get("question_id"),
         "question": qa.get("question", ""),
+        "retrieval_query": retrieval_query,
         "subject": qa.get("subject"),
         "year": qa.get("year"),
         "period": qa.get("period"),
@@ -145,10 +153,15 @@ def build_kormedmcqa_cache(
 
         for qa in records:
             question = qa.get("question", "")
-            retrieved = retriever.search(question, top_k=top_k)
-            entry = build_cache_entry(normalized_split, qa, retrieved)
+            retrieval_query = build_retrieval_query(
+                question=question,
+                dataset="KorMedMCQA",
+                options=qa.get("options"),
+            )
+            retrieved = retriever.search(retrieval_query, top_k=top_k)
+            entry = build_cache_entry(normalized_split, qa, retrieved, retrieval_query)
             entries.append(entry)
-            index_by_qhash[question_hash(question)] = len(entries) - 1
+            index_by_qhash[question_hash(retrieval_query)] = len(entries) - 1
 
         cache_data = {
             "meta": {

@@ -8,7 +8,7 @@ from .io_utils import (
 )
 from .logging_utils import setup_logging
 from .logging_utils import setup_category_loggers
-from .retrieval_cache import SparseRetrievalCache, question_hash
+from .retrieval_cache import SparseRetrievalCache, question_hash, build_retrieval_query
 
 __all__ = [
     'save_results',
@@ -20,5 +20,6 @@ __all__ = [
     'setup_logging',
     'setup_category_loggers',
     'SparseRetrievalCache',
-    'question_hash'
+    'question_hash',
+    'build_retrieval_query',
 ]
