@@ -4,6 +4,7 @@ keys.py
 data/
 KorMedMCQA/
 retrieval_cache/
-qwen/
+models/
 outputs/
 legacy/
+vast_ai.txt
