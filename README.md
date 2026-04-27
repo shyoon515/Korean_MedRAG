@@ -75,6 +75,8 @@ pip install rank-bm25 kiwipiepy sentence-transformers tqdm langchain-text-splitt
 ```bash
 python src/build_sparse_cache.py --top-k 20
 python src/build_kormedmcqa_sparse_cache.py --top-k 20
+python src/build_dense_cache.py --encoder BAAI/bge-m3
+python src/build_kormedmcqa_dense_cache.py --encoder BAAI/bge-m3
 ```
 
 ### 3. 커스텀 설정
