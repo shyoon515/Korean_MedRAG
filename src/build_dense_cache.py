@@ -112,6 +112,7 @@ def build_dense_cache(
     queries_per_source: int = 10,
     sample_seed: int = 42,
     batch_size: int = 64,
+    use_existing_index: bool = True,
 ) -> Dict[str, Any]:
     (
         CorpusLoader,
@@ -145,26 +146,31 @@ def build_dense_cache(
         index_root,
     )
 
-    corpus_loader = CorpusLoader(
-        corpus_dir=str(corpus_dir),
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        max_docs_per_folder=max_docs_per_folder,
-        logger=pipeline_logger,
-    )
     qa_loader = QALoader(str(qa_train_dir), str(qa_test_dir), logger=pipeline_logger)
 
-    chunks = corpus_loader.load_korean_corpus()
-
+    index_dir = index_root / "data_corpus_index"
     retriever = DenseRetriever(
         model_name=model_name,
         batch_size=batch_size,
         logger=pipeline_logger,
     )
-    retriever.build_index(chunks)
 
-    index_dir = index_root / "data_corpus_index"
-    retriever.save_index(str(index_dir))
+    if use_existing_index:
+        pipeline_logger.info("Loading existing dense index: %s", index_dir)
+        retriever.load_index(str(index_dir))
+        total_chunks = int(retriever.index.ntotal) if retriever.index is not None else 0
+    else:
+        corpus_loader = CorpusLoader(
+            corpus_dir=str(corpus_dir),
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            max_docs_per_folder=max_docs_per_folder,
+            logger=pipeline_logger,
+        )
+        chunks = corpus_loader.load_korean_corpus()
+        retriever.build_index(chunks)
+        retriever.save_index(str(index_dir))
+        total_chunks = len(chunks)
 
     by_source = collect_queries_by_source(qa_loader, str(qa_train_dir), str(qa_test_dir))
     source_names = sorted(by_source.keys())
@@ -179,9 +185,10 @@ def build_dense_cache(
             "top_k": top_k,
             "chunk_size": chunk_size,
             "chunk_overlap": chunk_overlap,
-            "total_chunks": len(chunks),
+            "total_chunks": total_chunks,
             "queries_per_source": queries_per_source,
             "sample_seed": sample_seed,
+            "use_existing_index": use_existing_index,
             "schema": "v1-by-source",
         },
         "index": {
@@ -218,7 +225,7 @@ def build_dense_cache(
                 "top_k": top_k,
                 "chunk_size": chunk_size,
                 "chunk_overlap": chunk_overlap,
-                "total_chunks": len(chunks),
+                "total_chunks": total_chunks,
                 "total_queries": len(entries),
                 "query_source": source_name,
                 "index_dir": str(index_dir),
@@ -290,6 +297,11 @@ if __name__ == "__main__":
     parser.add_argument("--max-queries", type=int, default=None)
     parser.add_argument("--queries-per-source", type=int, default=10)
     parser.add_argument("--sample-seed", type=int, default=42)
+    parser.add_argument(
+        "--use-existing-index",
+        action="store_true",
+        help="Reuse existing index at <index-root>/data_corpus_index instead of rebuilding embeddings",
+    )
     args = parser.parse_args()
 
     workspace_root = find_workspace_root(Path(__file__))
@@ -314,4 +326,5 @@ if __name__ == "__main__":
         queries_per_source=args.queries_per_source,
         sample_seed=args.sample_seed,
         batch_size=args.batch_size,
+        use_existing_index=args.use_existing_index,
     )

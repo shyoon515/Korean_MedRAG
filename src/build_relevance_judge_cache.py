@@ -22,14 +22,14 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from src.core.generator.llm import OpenAIGenerator
+from src.core.generator.llm import VLLMGenerator
 from src.core.utils.logging_utils import setup_category_loggers
 
 
 class RetrievalRelevanceJudge:
     """Binary relevance judge using an LLM."""
 
-    def __init__(self, generator: OpenAIGenerator):
+    def __init__(self, generator: VLLMGenerator):
         self.generator = generator
 
     def judge(self, question: str, context: str) -> Dict[str, Any]:
@@ -243,7 +243,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build LLM relevance-judge cache for retrieval results")
     parser.add_argument("--cache-root", type=str, default="retrieval_cache/bm25")
     parser.add_argument("--output-root", type=str, default="retrieval_cache/bm25_llmjudge")
-    parser.add_argument("--model", type=str, default="gpt-5-nano")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-32B-Instruct")
+    parser.add_argument("--api-base", type=str, default="http://localhost:8000/v1")
     parser.add_argument("--max-rank", type=int, default=10)
     parser.add_argument("--max-files", type=int, default=0, help="0 means all files")
     parser.add_argument("--max-entries-per-file", type=int, default=0, help="0 means all entries")
@@ -288,7 +289,7 @@ def main() -> None:
     if not cache_files:
         raise ValueError("No cache files selected for evaluation. Check --cache-root/--include-files")
 
-    generator = OpenAIGenerator(model_name=args.model, logger=loggers["generation"])
+    generator = VLLMGenerator(model_name=args.model, api_base=args.api_base, logger=loggers["generation"])
     judge = RetrievalRelevanceJudge(generator=generator)
 
     total_judged = 0

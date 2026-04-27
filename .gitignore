@@ -8,3 +8,4 @@ models/
 outputs/
 legacy/
 vast_ai.txt
+dense_index/
