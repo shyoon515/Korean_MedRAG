@@ -32,6 +32,7 @@ def _load_core_components():
             DenseRetriever,
             KorMedMCQALoader,
             SparseRetrievalCache,
+            build_retrieval_query,
             question_hash,
             setup_category_loggers,
         )
@@ -41,6 +42,7 @@ def _load_core_components():
             DenseRetriever,
             KorMedMCQALoader,
             SparseRetrievalCache,
+            build_retrieval_query,
             question_hash,
             setup_category_loggers,
         )
@@ -50,6 +52,7 @@ def _load_core_components():
         DenseRetriever,
         KorMedMCQALoader,
         SparseRetrievalCache,
+        build_retrieval_query,
         question_hash,
         setup_category_loggers,
     )
@@ -65,13 +68,19 @@ KORMEDMCQA_SPLITS = [
 ]
 
 
-def build_cache_entry(split_name: str, qa: Dict[str, Any], retrieved: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_cache_entry(
+    split_name: str,
+    qa: Dict[str, Any],
+    retrieved: List[Dict[str, Any]],
+    retrieval_query: str,
+) -> Dict[str, Any]:
     return {
         "dataset": "KorMedMCQA",
         "split": split_name,
         "source": split_name,
         "question_id": qa.get("question_id"),
         "question": qa.get("question", ""),
+        "retrieval_query": retrieval_query,
         "subject": qa.get("subject"),
         "year": qa.get("year"),
         "period": qa.get("period"),
@@ -108,12 +117,14 @@ def build_kormedmcqa_dense_index(
     max_docs_per_folder: int | None = None,
     split_specs: List[str] | None = None,
     batch_size: int = 64,
+    use_existing_index: bool = False,
 ) -> Dict[str, Any]:
     (
         CorpusLoader,
         DenseRetriever,
         KorMedMCQALoader,
         SparseRetrievalCache,
+        build_retrieval_query,
         question_hash,
         setup_category_loggers,
     ) = _load_core_components()
@@ -147,26 +158,31 @@ def build_kormedmcqa_dense_index(
     if not dataset_root.exists():
         raise FileNotFoundError(f"KorMedMCQA dataset root not found: {dataset_root}")
 
-    corpus_loader = CorpusLoader(
-        corpus_dir=str(corpus_dir),
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        max_docs_per_folder=max_docs_per_folder,
-        logger=pipeline_logger,
-    )
     qa_loader = KorMedMCQALoader(str(dataset_root), logger=pipeline_logger)
 
-    chunks = corpus_loader.load_korean_corpus()
-
+    index_dir = index_root / "kormedmcqa_corpus_index"
     retriever = DenseRetriever(
         model_name=model_name,
         batch_size=batch_size,
         logger=pipeline_logger,
     )
-    retriever.build_index(chunks)
 
-    index_dir = index_root / "kormedmcqa_corpus_index"
-    retriever.save_index(str(index_dir))
+    if use_existing_index:
+        pipeline_logger.info("Loading existing dense index: %s", index_dir)
+        retriever.load_index(str(index_dir))
+        total_chunks = int(retriever.index.ntotal) if retriever.index is not None else 0
+    else:
+        corpus_loader = CorpusLoader(
+            corpus_dir=str(corpus_dir),
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            max_docs_per_folder=max_docs_per_folder,
+            logger=pipeline_logger,
+        )
+        chunks = corpus_loader.load_korean_corpus()
+        retriever.build_index(chunks)
+        retriever.save_index(str(index_dir))
+        total_chunks = len(chunks)
 
     requested_splits = split_specs or KORMEDMCQA_SPLITS
     split_records = qa_loader.load_splits(requested_splits)
@@ -180,11 +196,12 @@ def build_kormedmcqa_dense_index(
             "top_k": top_k,
             "chunk_size": chunk_size,
             "chunk_overlap": chunk_overlap,
-            "total_chunks": len(chunks),
+            "total_chunks": total_chunks,
             "schema": "v1",
             "workspace_root": str(workspace_root),
             "dataset_root": str(dataset_root),
             "corpus_dir": str(corpus_dir),
+            "use_existing_index": use_existing_index,
         },
         "index": {
             "index_dir": str(index_dir),
@@ -207,10 +224,15 @@ def build_kormedmcqa_dense_index(
 
         for qa in records:
             question = qa.get("question", "")
-            retrieved = retriever.search(question, top_k=top_k)
-            entry = build_cache_entry(normalized_split, qa, retrieved)
+            retrieval_query = build_retrieval_query(
+                question=question,
+                dataset="KorMedMCQA",
+                options=qa.get("options"),
+            )
+            retrieved = retriever.search(retrieval_query, top_k=top_k)
+            entry = build_cache_entry(normalized_split, qa, retrieved, retrieval_query)
             entries.append(entry)
-            index_by_qhash[question_hash(question)] = len(entries) - 1
+            index_by_qhash[question_hash(retrieval_query)] = len(entries) - 1
 
         cache_data = {
             "meta": {
@@ -222,7 +244,7 @@ def build_kormedmcqa_dense_index(
                 "top_k": top_k,
                 "chunk_size": chunk_size,
                 "chunk_overlap": chunk_overlap,
-                "total_chunks": len(chunks),
+                "total_chunks": total_chunks,
                 "total_queries": len(entries),
                 "index_dir": str(index_dir),
                 "schema": "v1",
@@ -290,6 +312,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-docs-per-folder", type=int, default=None)
     parser.add_argument(
+        "--use-existing-index",
+        action="store_true",
+        help="Reuse existing index at <index-root>/kormedmcqa_corpus_index instead of rebuilding embeddings",
+    )
+    parser.add_argument(
         "--splits",
         type=str,
         nargs="*",
@@ -317,4 +344,5 @@ if __name__ == "__main__":
         max_docs_per_folder=args.max_docs_per_folder,
         split_specs=args.splits,
         batch_size=args.batch_size,
+        use_existing_index=args.use_existing_index,
     )
