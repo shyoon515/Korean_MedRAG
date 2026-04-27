@@ -1,0 +1,13 @@
+## Sparse (BM25) 테스트용 최소 requirements
+
+# Retrieval (Sparse)
+rank-bm25>=0.2.2
+kiwipiepy>=0.17.0  # 한국어 형태소 분석
+
+# Data Processing
+tqdm>=4.65.0
+langchain-text-splitters>=0.0.1
+pyarrow>=15.0.0
+
+# Utils
+numpy>=1.24.0

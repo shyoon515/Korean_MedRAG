@@ -1,0 +1,9 @@
+*.pyc
+__pycache__/
+keys.py
+data/
+KorMedMCQA/
+retrieval_cache/
+qwen/
+outputs/
+legacy/
