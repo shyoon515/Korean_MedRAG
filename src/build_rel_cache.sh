@@ -1,0 +1,3 @@
+python src/build_relevance_judge_cache.py --cache-root retrieval_cache/bm25 --output-root retrieval_cache/bm25_llmjudge --model Qwen/Qwen2.5-14B-Instruct --api-base http://localhost:8000/v1 --max-rank 10 --max-files 1000000 --max-entries-per-file 1000000 --batch-size 128 --max-workers 8 --max-retries 2 --retry-delay-sec 1.0 --request-timeout-sec 120 --overwrite
+
+python src/build_relevance_judge_cache.py --cache-root retrieval_cache/dense --output-root retrieval_cache/dense_llmjudge --model Qwen/Qwen2.5-14B-Instruct --api-base http://localhost:8000/v1 --max-rank 10 --max-files 1000000 --max-entries-per-file 1000000 --batch-size 128 --max-workers 8 --max-retries 2 --retry-delay-sec 1.0 --request-timeout-sec 120 --overwrite

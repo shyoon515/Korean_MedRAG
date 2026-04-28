@@ -1,7 +1,9 @@
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib.util
 from pathlib import Path
+from threading import Lock
 from typing import List, Optional
 
 from openai import OpenAI
@@ -117,11 +119,81 @@ class VLLMGenerator:
         model_name: str,
         api_base: str = "http://localhost:8000/v1",
         api_key: str = "EMPTY",
+        max_workers: int = 8,
+        max_retries: int = 2,
+        retry_delay_sec: float = 1.0,
+        request_timeout_sec: float = 120.0,
         logger=None,
     ):
         self.client = OpenAI(api_key=api_key, base_url=api_base)
         self.model_name = self.MODEL_ALIAS.get(model_name, model_name)
+        self.max_workers = max(1, int(max_workers))
+        self.max_retries = max(1, int(max_retries))
+        self.retry_delay_sec = max(0.0, float(retry_delay_sec))
+        self.request_timeout_sec = max(1.0, float(request_timeout_sec))
         self.logger = logger
+        self._stats_lock = Lock()
+        self._stats = {
+            "requests": 0,
+            "retries": 0,
+            "failures": 0,
+        }
+
+    def _update_stats(self, retries_used: int, failed: bool) -> None:
+        with self._stats_lock:
+            self._stats["requests"] += 1
+            self._stats["retries"] += max(0, retries_used)
+            if failed:
+                self._stats["failures"] += 1
+
+    def get_stats_snapshot(self) -> dict:
+        with self._stats_lock:
+            return dict(self._stats)
+
+    def _generate_one(
+        self,
+        prompt: str,
+        idx: int,
+        total: int,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> str:
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    timeout=self.request_timeout_sec,
+                )
+                text = (response.choices[0].message.content or "").strip()
+                self._update_stats(retries_used=attempt - 1, failed=False)
+                if self.logger:
+                    self.logger.info(
+                        "[VLLMGenerator] generated %s/%s\n[INPUT PROMPT]\n%s\n[OUTPUT]\n%s",
+                        idx + 1,
+                        total,
+                        prompt,
+                        text,
+                    )
+                return text
+            except Exception as exc:  # pragma: no cover - network path
+                if self.logger:
+                    self.logger.warning(
+                        "[VLLMGenerator] failed (%s/%s) for prompt %s: %s",
+                        attempt,
+                        self.max_retries,
+                        idx + 1,
+                        exc,
+                    )
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_delay_sec)
+
+        self._update_stats(retries_used=self.max_retries - 1, failed=True)
+        return "__VLLM_REQUEST_FAILED__"
 
     def generate(
         self,
@@ -133,24 +205,54 @@ class VLLMGenerator:
         if isinstance(prompts, str):
             prompts = [prompts]
 
-        responses: List[str] = []
-        for idx, prompt in enumerate(prompts):
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-            )
-            text = (response.choices[0].message.content or "").strip()
-            responses.append(text)
-            if self.logger:
-                self.logger.info(
-                    "[VLLMGenerator] generated %s/%s\n[INPUT PROMPT]\n%s\n[OUTPUT]\n%s",
-                    idx + 1,
-                    len(prompts),
-                    prompt,
-                    text,
+        if not prompts:
+            return []
+
+        total = len(prompts)
+        if total == 1 or self.max_workers == 1:
+            return [
+                self._generate_one(
+                    prompt=prompts[0],
+                    idx=0,
+                    total=1,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
                 )
+            ] if total == 1 else [
+                self._generate_one(
+                    prompt=prompt,
+                    idx=idx,
+                    total=total,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+                for idx, prompt in enumerate(prompts)
+            ]
+
+        responses: List[str] = [""] * total
+        worker_count = min(self.max_workers, total)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    self._generate_one,
+                    prompt,
+                    idx,
+                    total,
+                    max_tokens,
+                    temperature,
+                    top_p,
+                ): idx
+                for idx, prompt in enumerate(prompts)
+            }
+
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    responses[idx] = future.result()
+                except Exception:  # pragma: no cover - safety path
+                    self._update_stats(retries_used=self.max_retries - 1, failed=True)
+                    responses[idx] = "__VLLM_REQUEST_FAILED__"
 
         return responses

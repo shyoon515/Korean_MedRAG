@@ -16,6 +16,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from tqdm import tqdm
 
 # Ensure workspace root is importable when this file is run directly.
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -35,17 +36,51 @@ class RetrievalRelevanceJudge:
     def judge(self, question: str, context: str) -> Dict[str, Any]:
         prompt = self._build_prompt(question=question, context=context)
         raw = self.generator.generate([prompt])[0]
-        
-        ####
-        try:
-            result = int(raw.strip())
-            relevance = 1 if result == 1 else 0
-            return {        "relevance": relevance,     "reason": "dummy_reason", "raw": raw}
-        except:
-            return {        "relevance": 0, "reason": "parse_error", "raw": raw}
-        ####
 
-        return self._parse(raw)
+        return self._parse_binary(raw)
+
+    def judge_batch(
+        self,
+        question_context_pairs: List[Tuple[str, str]],
+        batch_size: int,
+    ) -> List[Dict[str, Any]]:
+        if not question_context_pairs:
+            return []
+
+        effective_batch_size = max(1, int(batch_size))
+        results: List[Dict[str, Any]] = []
+        for start in range(0, len(question_context_pairs), effective_batch_size):
+            pairs_chunk = question_context_pairs[start : start + effective_batch_size]
+            prompts = [
+                self._build_prompt(question=question, context=context)
+                for question, context in pairs_chunk
+            ]
+            raws = self.generator.generate(prompts)
+            results.extend([self._parse_binary(raw) for raw in raws])
+
+        return results
+
+    @staticmethod
+    def _parse_binary(raw: str) -> Dict[str, Any]:
+        text = str(raw or "").strip()
+        if text.startswith("__VLLM_REQUEST_FAILED__"):
+            return {
+                "relevance": 0,
+                "reason": "request_failed",
+                "raw": text,
+                "error": "request_failed",
+            }
+
+        try:
+            result = int(text)
+            relevance = 1 if result == 1 else 0
+            return {"relevance": relevance, "reason": "dummy_reason", "raw": raw}
+        except Exception:
+            return {
+                "relevance": 0,
+                "reason": "parse_error",
+                "raw": raw,
+            }
 
     @staticmethod
     def _build_prompt(question: str, context: str) -> str:
@@ -151,6 +186,7 @@ def _evaluate_file(
     max_rank: int,
     overwrite: bool,
     max_entries: Optional[int],
+    batch_size: int,
     logger,
 ) -> Tuple[int, int]:
     src_data = _load_json(src_path)
@@ -166,8 +202,73 @@ def _evaluate_file(
 
     judged_items = 0
     positive_items = 0
+    failed_items = 0
+    batch_calls = 0
 
-    for entry_idx, entry in enumerate(entries):
+    entry_states: List[Optional[Dict[str, Any]]] = [None] * len(entries)
+    pending_items: List[Dict[str, Any]] = []
+
+    def _flush_pending(force: bool = False) -> None:
+        nonlocal failed_items, batch_calls
+
+        while len(pending_items) >= batch_size or (force and pending_items):
+            current_size = batch_size if len(pending_items) >= batch_size else len(pending_items)
+            batch_items = pending_items[:current_size]
+            del pending_items[:current_size]
+
+            pair_batch = [(item["question"], item["context"]) for item in batch_items]
+            judged_batch = judge.judge_batch(
+                question_context_pairs=pair_batch,
+                batch_size=batch_size,
+            )
+            batch_calls += 1
+
+            if len(judged_batch) < len(batch_items):
+                judged_batch.extend(
+                    [
+                        {
+                            "relevance": 0,
+                            "reason": "request_failed",
+                            "raw": "__VLLM_REQUEST_FAILED__",
+                            "error": "request_failed",
+                        }
+                    ]
+                    * (len(batch_items) - len(judged_batch))
+                )
+            elif len(judged_batch) > len(batch_items):
+                judged_batch = judged_batch[: len(batch_items)]
+
+            for request_item, judged in zip(batch_items, judged_batch):
+                state = request_item["state"]
+                item = request_item["item"]
+                rank_idx = int(request_item["rank_idx"])
+
+                relevance = int(judged.get("relevance", 0))
+                relevance = 1 if relevance == 1 else 0
+
+                item["llm_relevance_01"] = relevance
+                item["llm_relevance_reason"] = judged.get("reason", "")
+                item["llm_relevance_model"] = model
+                item["llm_relevance_rank_scope"] = rank_idx
+
+                error_text = str(judged.get("error", "")).strip()
+                if error_text:
+                    item["llm_relevance_error"] = error_text
+                    failed_items += 1
+                else:
+                    item.pop("llm_relevance_error", None)
+
+                state["local_judged"] += 1
+                if relevance == 1:
+                    state["local_positive"] += 1
+
+    generator_stats_before = None
+    if hasattr(judge.generator, "get_stats_snapshot"):
+        generator_stats_before = judge.generator.get_stats_snapshot()
+
+    for entry_idx, entry in enumerate(
+        tqdm(entries, desc=f"Processing {src_path.name}")
+    ):
         question = str(entry.get("question", "")).strip()
         if not question:
             continue
@@ -176,13 +277,19 @@ def _evaluate_file(
         if not isinstance(retrieved_items, list):
             continue
 
-        local_positive = 0
-        local_judged = 0
+        state: Dict[str, Any] = {
+            "entry": entry,
+            "retrieved_items": retrieved_items,
+            "local_positive": 0,
+            "local_judged": 0,
+        }
+        entry_states[entry_idx] = state
+
         for rank_idx, item in enumerate(retrieved_items[:max_rank], start=1):
             if (not overwrite) and ("llm_relevance_01" in item):
-                local_judged += 1
+                state["local_judged"] += 1
                 if int(item.get("llm_relevance_01", 0)) == 1:
-                    local_positive += 1
+                    state["local_positive"] += 1
                 continue
 
             context = str(item.get("text", "")).strip()
@@ -190,21 +297,36 @@ def _evaluate_file(
                 item["llm_relevance_01"] = 0
                 item["llm_relevance_reason"] = "empty_context"
                 item["llm_relevance_model"] = model
-                local_judged += 1
+                item["llm_relevance_rank_scope"] = rank_idx
+                state["local_judged"] += 1
                 continue
 
-            judged = judge.judge(question=question, context=context)
-            relevance = int(judged.get("relevance", 0))
-            relevance = 1 if relevance == 1 else 0
+            pending_items.append(
+                {
+                    "question": question,
+                    "context": context,
+                    "rank_idx": rank_idx,
+                    "item": item,
+                    "state": state,
+                }
+            )
 
-            item["llm_relevance_01"] = relevance
-            item["llm_relevance_reason"] = judged.get("reason", "")
-            item["llm_relevance_model"] = model
-            item["llm_relevance_rank_scope"] = rank_idx
+            if len(pending_items) >= batch_size:
+                _flush_pending(force=False)
 
-            local_judged += 1
-            if relevance == 1:
-                local_positive += 1
+        if logger and (entry_idx + 1) % 100 == 0:
+            logger.info("Progress %s: %s/%s entries processed", src_path.name, entry_idx + 1, len(entries))
+
+    _flush_pending(force=True)
+
+    for state in entry_states:
+        if state is None:
+            continue
+
+        entry = state["entry"]
+        retrieved_items = state["retrieved_items"]
+        local_positive = int(state["local_positive"])
+        local_judged = int(state["local_judged"])
 
         evaluated_items = retrieved_items[:max_rank]
         labels_list: List[int] = [int(item.get("llm_relevance_01", 0)) for item in evaluated_items]
@@ -230,8 +352,25 @@ def _evaluate_file(
         judged_items += local_judged
         positive_items += local_positive
 
-        if logger and (entry_idx + 1) % 100 == 0:
-            logger.info("Progress %s: %s/%s entries processed", src_path.name, entry_idx + 1, len(entries))
+    retry_delta = 0
+    failure_delta = 0
+    if generator_stats_before is not None:
+        generator_stats_after = judge.generator.get_stats_snapshot()
+        retry_delta = int(generator_stats_after.get("retries", 0)) - int(generator_stats_before.get("retries", 0))
+        failure_delta = int(generator_stats_after.get("failures", 0)) - int(generator_stats_before.get("failures", 0))
+
+    if logger:
+        logger.info(
+            "FileStats file=%s batch_size=%s concurrency=%s batch_calls=%s judged=%s failed_items=%s retries=%s request_failures=%s",
+            src_path.name,
+            batch_size,
+            getattr(judge.generator, "max_workers", 1),
+            batch_calls,
+            judged_items,
+            failed_items,
+            retry_delta,
+            failure_delta,
+        )
 
     _upsert_meta(out_data, model=model, max_rank=max_rank)
     _save_json(dst_path, out_data)
@@ -243,9 +382,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build LLM relevance-judge cache for retrieval results")
     parser.add_argument("--cache-root", type=str, default="retrieval_cache/bm25")
     parser.add_argument("--output-root", type=str, default="retrieval_cache/bm25_llmjudge")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-32B-Instruct")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-14B-Instruct")
     parser.add_argument("--api-base", type=str, default="http://localhost:8000/v1")
     parser.add_argument("--max-rank", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--max-workers", type=int, default=8)
+    parser.add_argument("--request-timeout-sec", type=float, default=120.0)
+    parser.add_argument("--max-retries", type=int, default=2, help="2 means 1 retry after first failure")
+    parser.add_argument("--retry-delay-sec", type=float, default=1.0)
     parser.add_argument("--max-files", type=int, default=0, help="0 means all files")
     parser.add_argument("--max-entries-per-file", type=int, default=0, help="0 means all entries")
     parser.add_argument(
@@ -259,6 +403,14 @@ def main() -> None:
 
     if args.max_rank < 1:
         raise ValueError("--max-rank must be >= 1")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
+    if args.max_workers < 1:
+        raise ValueError("--max-workers must be >= 1")
+    if args.max_retries < 1:
+        raise ValueError("--max-retries must be >= 1")
+    if args.request_timeout_sec <= 0:
+        raise ValueError("--request-timeout-sec must be > 0")
 
     workspace_root = Path(__file__).resolve().parents[1]
     cache_root = (workspace_root / args.cache_root).resolve()
@@ -272,7 +424,16 @@ def main() -> None:
     pipeline_logger = loggers["pipeline"]
 
     pipeline_logger.info("Relevance judge cache build started")
-    pipeline_logger.info("cache_root=%s output_root=%s model=%s", cache_root, output_root, args.model)
+    pipeline_logger.info(
+        "cache_root=%s output_root=%s model=%s batch_size=%s max_workers=%s max_retries=%s timeout_sec=%.2f",
+        cache_root,
+        output_root,
+        args.model,
+        args.batch_size,
+        args.max_workers,
+        args.max_retries,
+        args.request_timeout_sec,
+    )
 
     cache_files = _resolve_cache_files(cache_root)
     include_files = [name.strip() for name in args.include_files.split(",") if name.strip()]
@@ -289,7 +450,15 @@ def main() -> None:
     if not cache_files:
         raise ValueError("No cache files selected for evaluation. Check --cache-root/--include-files")
 
-    generator = VLLMGenerator(model_name=args.model, api_base=args.api_base, logger=loggers["generation"])
+    generator = VLLMGenerator(
+        model_name=args.model,
+        api_base=args.api_base,
+        max_workers=args.max_workers,
+        max_retries=args.max_retries,
+        retry_delay_sec=args.retry_delay_sec,
+        request_timeout_sec=args.request_timeout_sec,
+        logger=loggers["generation"],
+    )
     judge = RetrievalRelevanceJudge(generator=generator)
 
     total_judged = 0
@@ -308,6 +477,7 @@ def main() -> None:
             max_rank=args.max_rank,
             overwrite=args.overwrite,
             max_entries=max_entries,
+            batch_size=args.batch_size,
             logger=pipeline_logger,
         )
 
